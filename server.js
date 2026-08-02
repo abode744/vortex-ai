@@ -28,26 +28,29 @@ Your tone is professional yet conversational, engaging, and intelligent.`,
 
 // ─── Provider Definitions ─────────────────────────────────────────────────────
 const PROVIDERS = [
-  // ── 1. Groq (ultra-fast, free tier) ──────────────────────────────────────
+  // ── 1. Groq (ultra-fast, free tier, text-only) ───────────────────────────
   {
     name: 'Groq / llama-3.3-70b',
     url: 'https://api.groq.com/openai/v1/chat/completions',
     apiKey: () => process.env.GROQ_API_KEY,
     model: 'llama-3.3-70b-versatile',
+    textOnly: true, // Groq does not support image content arrays
   },
   {
     name: 'Groq / llama-3.1-8b',
     url: 'https://api.groq.com/openai/v1/chat/completions',
     apiKey: () => process.env.GROQ_API_KEY,
     model: 'llama-3.1-8b-instant',
+    textOnly: true,
   },
   {
     name: 'Groq / mixtral-8x7b',
     url: 'https://api.groq.com/openai/v1/chat/completions',
     apiKey: () => process.env.GROQ_API_KEY,
     model: 'mixtral-8x7b-32768',
+    textOnly: true,
   },
-  // ── 2. OpenRouter (fallback, many free models) ────────────────────────────
+  // ── 2. OpenRouter (fallback, supports vision + multimodal) ───────────────
   {
     name: 'OpenRouter / gemini-2.0-flash',
     url: 'https://openrouter.ai/api/v1/chat/completions',
@@ -63,6 +66,7 @@ const PROVIDERS = [
     url: 'https://openrouter.ai/api/v1/chat/completions',
     apiKey: () => process.env.OPENROUTER_API_KEY,
     model: 'meta-llama/llama-3.3-70b-instruct:free',
+    textOnly: true,
     extraHeaders: {
       'HTTP-Referer': 'https://vortex-ai-production-7bd3.up.railway.app',
       'X-Title': 'Vortex AI',
@@ -73,6 +77,7 @@ const PROVIDERS = [
     url: 'https://openrouter.ai/api/v1/chat/completions',
     apiKey: () => process.env.OPENROUTER_API_KEY,
     model: 'mistralai/mistral-7b-instruct:free',
+    textOnly: true,
     extraHeaders: {
       'HTTP-Referer': 'https://vortex-ai-production-7bd3.up.railway.app',
       'X-Title': 'Vortex AI',
@@ -83,12 +88,28 @@ const PROVIDERS = [
     url: 'https://openrouter.ai/api/v1/chat/completions',
     apiKey: () => process.env.OPENROUTER_API_KEY,
     model: 'deepseek/deepseek-r1:free',
+    textOnly: true,
     extraHeaders: {
       'HTTP-Referer': 'https://vortex-ai-production-7bd3.up.railway.app',
       'X-Title': 'Vortex AI',
     },
   },
 ];
+
+// Flatten array content to plain text for providers that don't support vision
+function normalizeMessages(messages, textOnly) {
+  if (!textOnly) return messages;
+  return messages.map(msg => {
+    if (Array.isArray(msg.content)) {
+      const text = msg.content
+        .filter(p => p.type === 'text')
+        .map(p => p.text)
+        .join('\n');
+      return { ...msg, content: text || '(no text)' };
+    }
+    return msg;
+  });
+}
 
 // ─── Chat Session Store ────────────────────────────────────────────────────────
 const sessions = new Map();
@@ -110,6 +131,7 @@ async function sendWithFallback(messages) {
     }
 
     try {
+      const normalizedMessages = normalizeMessages(messages, provider.textOnly);
       const res = await fetch(provider.url, {
         method: 'POST',
         headers: {
@@ -119,7 +141,7 @@ async function sendWithFallback(messages) {
         },
         body: JSON.stringify({
           model: provider.model,
-          messages,
+          messages: normalizedMessages,
           temperature: 0.9,
           max_tokens: 4096,
         }),
@@ -128,9 +150,10 @@ async function sendWithFallback(messages) {
       if (!res.ok) {
         const body = await res.text();
         const isQuota = res.status === 429 || body.includes('quota') || body.includes('rate_limit');
+        const isBadReq = res.status === 400;
         console.warn(`⚠️  ${provider.name} → HTTP ${res.status}${isQuota ? ' (quota)' : ''}`);
         lastError = new Error(`${provider.name} HTTP ${res.status}: ${body.slice(0, 120)}`);
-        if (isQuota) {
+        if (isQuota || isBadReq) {
           await new Promise(r => setTimeout(r, 800));
           continue; // try next provider
         }
@@ -224,31 +247,21 @@ app.post('/api/clear', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── API: Image Generation (Hugging Face FLUX.1-schnell) ──────────────────────
+// ─── API: Image Generation (Pollinations.ai — free, no key required) ──────────
 app.post('/api/generate-image', async (req, res) => {
   try {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'Image prompt is required.' });
-    if (!process.env.HUGGINGFACE_API_KEY)
-      return res.status(500).json({ error: 'Hugging Face API key not configured.' });
 
-    const response = await fetch(
-      'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ inputs: prompt, parameters: { num_inference_steps: 4, guidance_scale: 0.0 } }),
-      }
-    );
+    // Pollinations.ai: free, no API key, returns image directly
+    const encodedPrompt = encodeURIComponent(prompt);
+    const seed = Math.floor(Math.random() * 999999);
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&seed=${seed}&nologo=true&enhance=true`;
+
+    const response = await fetch(imageUrl, { method: 'GET' });
 
     if (!response.ok) {
-      const errText = await response.text();
-      if (response.status === 503)
-        return res.status(503).json({ error: 'Model is loading, please try again in 20-30 seconds.', loading: true });
-      throw new Error(`HuggingFace API error ${response.status}: ${errText}`);
+      throw new Error(`Pollinations API error ${response.status}`);
     }
 
     const imageBuffer = await response.buffer();
@@ -262,6 +275,7 @@ app.post('/api/generate-image', async (req, res) => {
     res.status(500).json({ error: `Image generation failed: ${error.message}` });
   }
 });
+
 
 // ─── API: Health Check ─────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
